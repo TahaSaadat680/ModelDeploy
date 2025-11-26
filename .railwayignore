@@ -1,0 +1,31 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+
+# Environment variables
+.env
+
+# Git
+.git/
+.gitattributes
+
+# Claude Code
+.claude/
+
+# Notebook (not needed for deployment)
+soil-classification.ipynb

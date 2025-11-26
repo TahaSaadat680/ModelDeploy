@@ -8,6 +8,8 @@ import io
 import base64
 import time
 import os
+import requests
+from pathlib import Path
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for React/Next.js frontend
@@ -17,20 +19,109 @@ MODEL_PATH = 'best_90plus_model.h5'
 CENTROIDS_PATH = 'class_centroids.npy'
 IMAGE_SIZE = (299, 299)
 
+# Model download URLs from Google Drive
+MODEL_URL = os.environ.get('MODEL_URL', '')
+CENTROIDS_URL = os.environ.get('CENTROIDS_URL', '')
+
 # Class names in order
 CLASS_NAMES = [
     'alluvial', 'black', 'cinder', 'clay', 
     'laterite', 'peat', 'red', 'sandy', 'yellow'
 ]
 
+def download_file_from_google_drive(file_id, filepath):
+    """Download file from Google Drive using gdown"""
+    try:
+        import gdown
+        print(f"Downloading {filepath} from Google Drive (ID: {file_id})...")
+        
+        url = f"https://drive.google.com/uc?id={file_id}"
+        gdown.download(url, filepath, quiet=False)
+        
+        # Check if file was actually downloaded
+        if Path(filepath).exists():
+            file_size = Path(filepath).stat().st_size
+            print(f"{filepath} downloaded successfully! ({file_size / (1024*1024):.1f}MB)")
+            return True
+        else:
+            print(f"Failed to download {filepath}")
+            return False
+        
+    except Exception as e:
+        print(f"Error downloading {filepath}: {e}")
+        return False
+
+def download_file(url, filepath):
+    """Download file from URL (supports Google Drive)"""
+    if not url:
+        return False
+    
+    # Check if it's a Google Drive URL
+    if 'drive.google.com' in url:
+        # Extract file ID from URL
+        if '/d/' in url:
+            file_id = url.split('/d/')[1].split('/')[0]
+        elif 'id=' in url:
+            file_id = url.split('id=')[1].split('&')[0]
+        else:
+            print(f"Could not extract file ID from URL: {url}")
+            return False
+        
+        return download_file_from_google_drive(file_id, filepath)
+    
+    # Regular download for other URLs
+    try:
+        print(f"Downloading {filepath}...")
+        response = requests.get(url, stream=True, timeout=300)
+        response.raise_for_status()
+        
+        with open(filepath, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        
+        print(f"{filepath} downloaded successfully!")
+        return True
+    except Exception as e:
+        print(f"Error downloading {filepath}: {e}")
+        return False
+
+def download_models():
+    """Download model and centroids if not present"""
+    # Download model
+    if not Path(MODEL_PATH).exists():
+        if MODEL_URL:
+            download_file(MODEL_URL, MODEL_PATH)
+        else:
+            print(f"Warning: {MODEL_PATH} not found and MODEL_URL not set")
+    
+    # Download centroids
+    if not Path(CENTROIDS_PATH).exists():
+        if CENTROIDS_URL:
+            download_file(CENTROIDS_URL, CENTROIDS_PATH)
+        else:
+            print(f"Warning: {CENTROIDS_PATH} not found and CENTROIDS_URL not set")
+
+# Download models if needed
+download_models()
+
 # Load model and centroids
 print("Loading model...")
-model = keras.models.load_model(MODEL_PATH)
-print("Model loaded successfully!")
+try:
+    model = keras.models.load_model(MODEL_PATH)
+    print("Model loaded successfully!")
+except Exception as e:
+    print(f"Error loading model: {e}")
+    print("Please upload the model file to Railway or set MODEL_URL environment variable")
+    model = None
 
 print("Loading class centroids...")
-class_centroids = np.load(CENTROIDS_PATH)
-print(f"Class centroids loaded! Shape: {class_centroids.shape}")
+try:
+    class_centroids = np.load(CENTROIDS_PATH, allow_pickle=True)
+    print(f"Class centroids loaded! Shape: {class_centroids.shape}")
+except Exception as e:
+    print(f"Error loading centroids: {e}")
+    class_centroids = None
 
 
 def preprocess_image(image):
@@ -101,6 +192,7 @@ def home():
         "message": "Soil Classification API",
         "model": "InceptionV3",
         "classes": len(CLASS_NAMES),
+        "model_loaded": model is not None,
         "endpoints": {
             "health": "/health",
             "predict": "/predict (POST)",
@@ -113,10 +205,11 @@ def home():
 @app.route('/health')
 def health():
     return jsonify({
-        "status": "healthy",
-        "model_loaded": True,
-        "centroids_loaded": True,
-        "num_classes": len(CLASS_NAMES)
+        "status": "healthy" if model is not None else "model_not_loaded",
+        "model_loaded": model is not None,
+        "centroids_loaded": class_centroids is not None,
+        "num_classes": len(CLASS_NAMES),
+        "message": "Upload model file or set MODEL_URL environment variable" if model is None else "Ready"
     }), 200
 
 
@@ -135,12 +228,19 @@ def model_info():
         "input_shape": [299, 299, 3],
         "num_classes": len(CLASS_NAMES),
         "classes": CLASS_NAMES,
-        "preprocessing": "InceptionV3 preprocessing function"
+        "preprocessing": "InceptionV3 preprocessing function",
+        "model_loaded": model is not None
     })
 
 
 @app.route('/predict', methods=['POST'])
 def predict():
+    if model is None:
+        return jsonify({
+            "success": False,
+            "error": "Model not loaded. Please upload the model file to Railway."
+        }), 503
+    
     start_time = time.time()
     
     try:
@@ -174,61 +274,6 @@ def predict():
                 "class_index": predicted_index,
                 "confidence": confidence,
                 "probabilities": probabilities
-            },
-            "processing_time": round(processing_time, 3)
-        })
-    
-    except ValueError as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 400
-    
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": f"Internal server error: {str(e)}"
-        }), 500
-
-
-@app.route('/predict-with-centroids', methods=['POST'])
-def predict_with_centroids():
-    """
-    Alternative prediction using centroid-based classification
-    """
-    start_time = time.time()
-    
-    try:
-        # Decode image from request
-        image = decode_image_from_request(request)
-        
-        # Preprocess image
-        processed_image = preprocess_image(image)
-        
-        # Get features from model (before final classification layer)
-        # Note: This assumes the model has a feature extraction layer
-        # You may need to adjust this based on your model architecture
-        features = model.predict(processed_image, verbose=0)
-        
-        # Calculate distances to centroids
-        distances = np.linalg.norm(class_centroids - features[0], axis=1)
-        predicted_index = int(np.argmin(distances))
-        predicted_class = CLASS_NAMES[predicted_index]
-        min_distance = float(distances[predicted_index])
-        
-        # Calculate processing time
-        processing_time = time.time() - start_time
-        
-        return jsonify({
-            "success": True,
-            "prediction": {
-                "class": predicted_class,
-                "class_index": predicted_index,
-                "distance": min_distance,
-                "all_distances": {
-                    CLASS_NAMES[i]: float(distances[i])
-                    for i in range(len(CLASS_NAMES))
-                }
             },
             "processing_time": round(processing_time, 3)
         })
